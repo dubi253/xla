@@ -555,6 +555,50 @@ TEST_F(AlgebraicSimplifierTest, FactorFpAdditionBfloat16) {
                   m::Broadcast(m::ConstantScalar(0.125)))));
 }
 
+// Test distributive property: A/C + B/C => (A+B)/C where C is a scalar
+TEST_F(AlgebraicSimplifierTest, DistDivScalar) {
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      p0 = s32[4] parameter(0)
+      p1 = s32[4] parameter(1)
+      c = s32[] constant(3)
+      b = s32[4] broadcast(c), dimensions={}
+      div0 = s32[4] divide(p0, b)
+      div1 = s32[4] divide(p1, b)
+      ROOT sum = s32[4] add(div0, div1)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  ASSERT_TRUE(AlgebraicSimplifier(default_options_).Run(m.get()).value());
+  EXPECT_THAT(m->entry_computation()->root_instruction(),
+              GmockMatch(m::Divide(
+                  m::AddAnyOrder(m::Parameter(0), m::Parameter(1)),
+                  m::Broadcast(m::ConstantScalar(3)))));
+}
+
+// Test distributive property with commuted operands: B/C + A/C => (A+B)/C
+TEST_F(AlgebraicSimplifierTest, DistDivScalarCommutative) {
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      p0 = s32[4] parameter(0)
+      p1 = s32[4] parameter(1)
+      c = s32[] constant(3)
+      b = s32[4] broadcast(c), dimensions={}
+      div0 = s32[4] divide(p0, b)
+      div1 = s32[4] divide(p1, b)
+      ROOT sum = s32[4] add(div1, div0)  // Operands are swapped here
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  ASSERT_TRUE(AlgebraicSimplifier(default_options_).Run(m.get()).value());
+  EXPECT_THAT(m->entry_computation()->root_instruction(),
+              GmockMatch(m::Divide(
+                  m::AddAnyOrder(m::Parameter(0), m::Parameter(1)),
+                  m::Broadcast(m::ConstantScalar(3)))));
+}
+
 TEST_F(AlgebraicSimplifierTest, UnsignedDivideByPowerOf2) {
   const char* kModuleStr = R"(
     HloModule m

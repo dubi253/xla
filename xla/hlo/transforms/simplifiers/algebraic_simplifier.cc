@@ -1011,6 +1011,30 @@ absl::Status AlgebraicSimplifierVisitor::HandleAdd(HloInstruction* add) {
                  c));
   }
 
+  // A/C + B/C => (A+B)/C where C is a scalar
+  if (((Match(lhs, m::Divide(m::Op(&a), m::Op(&c))) &&
+        Match(rhs, m::Divide(m::Op(&b), m::Op().Is(c)))) ||
+        (Match(lhs, m::Divide(m::Op(&b), m::Op(&c))) &&
+        Match(rhs, m::Divide(m::Op().Is(a), m::Op(&c))))) &&
+      (ShapeUtil::IsScalar(c->shape()) ||
+        (c->opcode() == HloOpcode::kBroadcast &&
+        ShapeUtil::IsScalar(c->operand(0)->shape()))) &&
+      // Make sure we would decrease the number of divides.
+      // This ensures the intermediate A/C and B/C are only used here.
+      (lhs->user_count() == 1 && rhs->user_count() == 1) &&
+      // Check for numerical safety, same as the multiplication rule.
+      (ShapeUtil::ElementIsIntegral(add->shape()) ||
+       options_.enable_floats_are_real() || IsAllFpConstantPowerOf2(c))) {
+
+    // Create the new (A+B)/C instruction and replace the original add
+    return ReplaceWithNewInstruction(
+        add, HloInstruction::CreateBinary(
+                  add->shape(), HloOpcode::kDivide, 
+                  lhs->AddInstruction(HloInstruction::CreateBinary(
+                      add->shape(), HloOpcode::kAdd, a, b)), 
+                  c));
+  }
+
   if (options_.is_layout_sensitive()) {
     return absl::OkStatus();
   }
