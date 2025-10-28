@@ -5003,6 +5003,31 @@ absl::Status AlgebraicSimplifierVisitor::HandleMultiply(
                                      MakeScalarLike(lhs, 1), lhs));
   }
 
+  // 1/X * 1/(X*C) => 1/(X*X) * C
+  // Example: 1/conv(A,B) * 1/(conv(A,B)*C) => 1/(conv(A,B)^2) * C
+  // Precondition: X ≠ 0, C ≠ 0, shape(X) = shape(C)
+  // Multiply(Divide(1, X), Divide(1, Multiply(X, C))) => Multiply(Divide(1, Multiply(X, X)), C)
+  VLOG(10) << "trying transform [1/X * 1/(X*C) => 1/(X*X) * C]: "
+           << multiply->ToString();
+  HloInstruction *x, *x1, *c, *one1, *one2;
+  if (Match(multiply,
+            m::Multiply(m::Divide(m::Op(&one1), m::Op(&x)),
+                        m::Divide(m::Op(&one2), m::Multiply(m::Op(&x1), m::Op(&c))))) &&
+      x == x1 && IsAll(one1, 1) && IsAll(one2, 1)) {
+    // Create X * X
+    HloInstruction* x_squared = multiply->AddInstruction(
+        HloInstruction::CreateBinary(x->shape(), HloOpcode::kMultiply, x, x));
+    // Create 1 / (X * X)
+    HloInstruction* recip_x_squared = multiply->AddInstruction(
+        HloInstruction::CreateBinary(multiply->shape(), HloOpcode::kDivide,
+                                     MakeScalarLike(x_squared, 1), x_squared));
+    // Create (1 / (X * X)) * C
+    return ReplaceWithNewInstruction(
+        multiply, HloInstruction::CreateBinary(multiply->shape(),
+                                               HloOpcode::kMultiply,
+                                               recip_x_squared, c));
+  }
+
   return TryToReorderConvAddMultiply(multiply);
 }
 

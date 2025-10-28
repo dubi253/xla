@@ -1579,6 +1579,36 @@ TEST_F(AlgebraicSimplifierTest, SquareMinusMultiply) {
                       m::Parameter(1)))));
 }
 
+TEST_F(AlgebraicSimplifierTest, RecipConvMultiplyRecipConvMultiply) {
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      p0 = f32[1,3,3,1] parameter(0)
+      p1 = f32[2,2,1,1] parameter(1)
+      p2 = f32[1,2,2,1] parameter(2)
+      conv = f32[1,2,2,1] convolution(p0, p1), window={size=2x2}, dim_labels=b01f_01io->b01f
+      one = f32[] constant(1)
+      one_bcast1 = f32[1,2,2,1] broadcast(one), dimensions={}
+      recip_conv = f32[1,2,2,1] divide(one_bcast1, conv)
+      conv_mul_c = f32[1,2,2,1] multiply(conv, p2)
+      one_bcast2 = f32[1,2,2,1] broadcast(one), dimensions={}
+      recip_conv_mul_c = f32[1,2,2,1] divide(one_bcast2, conv_mul_c)
+      ROOT mul = f32[1,2,2,1] multiply(recip_conv, recip_conv_mul_c)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  ASSERT_TRUE(AlgebraicSimplifier(default_options_).Run(m.get()).value());
+  // Transform: 1/conv(A,B) * 1/(conv(A,B)*C) => 1/(conv(A,B)^2) * C
+  // Expected: Multiply(Divide(1, Multiply(conv, conv)), C)
+  EXPECT_THAT(
+      m->entry_computation()->root_instruction(),
+      GmockMatch(m::Multiply(
+          m::Divide(m::Broadcast(m::ConstantScalar(1)),
+                    m::Multiply(m::Convolution(m::Parameter(0), m::Parameter(1)),
+                                m::Convolution(m::Parameter(0), m::Parameter(1)))),
+          m::Parameter(2))));
+}
+
 TEST_F(AlgebraicSimplifierTest, AddBroadcastZeroR0Operand) {
   auto m = CreateNewVerifiedModule();
   Shape r2f32 = ShapeUtil::MakeShape(F32, {3, 2});
