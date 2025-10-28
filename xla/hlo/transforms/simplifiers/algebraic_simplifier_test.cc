@@ -1609,6 +1609,40 @@ TEST_F(AlgebraicSimplifierTest, RecipConvMultiplyRecipConvMultiply) {
           m::Parameter(2))));
 }
 
+TEST_F(AlgebraicSimplifierTest, MultiplyReduceSumSquare) {
+  const char* kModuleStr = R"(
+    HloModule m
+    
+    add {
+      x = f32[] parameter(0)
+      y = f32[] parameter(1)
+      ROOT add = f32[] add(x, y)
+    }
+    
+    test {
+      p0 = f32[4] parameter(0)
+      p1 = f32[4,3] parameter(1)
+      p2 = f32[4] parameter(2)
+      zero = f32[] constant(0)
+      reduce = f32[4] reduce(p1, zero), dimensions={1}, to_apply=add
+      a_mul_reduce = f32[4] multiply(p0, reduce)
+      reduce_mul_c = f32[4] multiply(reduce, p2)
+      ROOT mul = f32[4] multiply(a_mul_reduce, reduce_mul_c)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  ASSERT_TRUE(AlgebraicSimplifier(default_options_).Run(m.get()).value());
+  // Transform: (A * ReduceSum(B)) * (ReduceSum(B) * C) => A * ReduceSum(B)^2 * C
+  // Expected: Multiply(Multiply(A, Multiply(Reduce, Reduce)), C)
+  EXPECT_THAT(
+      m->entry_computation()->root_instruction(),
+      GmockMatch(m::Multiply(
+          m::Multiply(m::Parameter(0),
+                      m::Multiply(m::Reduce(m::Parameter(1), m::ConstantScalar(0)),
+                                  m::Reduce(m::Parameter(1), m::ConstantScalar(0)))),
+          m::Parameter(2))));
+}
+
 TEST_F(AlgebraicSimplifierTest, AddBroadcastZeroR0Operand) {
   auto m = CreateNewVerifiedModule();
   Shape r2f32 = ShapeUtil::MakeShape(F32, {3, 2});

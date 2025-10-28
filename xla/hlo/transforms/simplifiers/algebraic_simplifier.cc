@@ -5027,6 +5027,31 @@ absl::Status AlgebraicSimplifierVisitor::HandleMultiply(
                                                HloOpcode::kMultiply,
                                                recip_x_squared, c));
   }
+  
+  // (A * X) * (X * C) => A * (X * X) * C
+  // Example: (A * ReduceSum(B)) * (ReduceSum(B) * C) => A * ReduceSum(B)^2 * C
+  // Precondition: shape(A) = shape(X) = shape(C)
+  // Multiply(Multiply(A, X), Multiply(X, C)) => Multiply(Multiply(A, Multiply(X, X)), C)
+  VLOG(10) << "trying transform [(A*X)*(X*C) => A*(X*X)*C]: "
+            << multiply->ToString();
+  if (Match(multiply,
+            m::Multiply(m::Multiply(m::Op(&a), m::Op(&x)),
+                        m::Multiply(m::Op(&x1), m::Op(&c)))) &&
+      x == x1) {
+    // Create X * X
+    HloInstruction* x_squared = multiply->AddInstruction(
+        HloInstruction::CreateBinary(x->shape(), HloOpcode::kMultiply, x, x));
+    // Create A * (X * X)
+    HloInstruction* a_mul_x_squared = multiply->AddInstruction(
+        HloInstruction::CreateBinary(multiply->shape(), HloOpcode::kMultiply,
+                                      a, x_squared));
+    // Create (A * (X * X)) * C
+    return ReplaceWithNewInstruction(
+        multiply, HloInstruction::CreateBinary(multiply->shape(),
+                                                HloOpcode::kMultiply,
+                                                a_mul_x_squared, c));
+  }
+
 
   return TryToReorderConvAddMultiply(multiply);
 }
