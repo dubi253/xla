@@ -2178,6 +2178,23 @@ absl::Status AlgebraicSimplifierVisitor::HandleSubtract(HloInstruction* sub) {
     return ReplaceInstruction(sub, MakeScalarLike(sub, 0));
   }
 
+  // square(A+B) - (A+B)*C => (A+B)*(A+B-C)
+  // Multiply(X, X) - Multiply(X, C) => Multiply(X, Subtract(X, C))
+  VLOG(10) << "trying transform [square(A+B) - (A+B)*C => (A+B)*(A+B-C)]: "
+           << sub->ToString();
+  HloInstruction *x, *x1, *x2, *c;
+  if (Match(sub, m::Subtract(m::Multiply(m::Op(&x1), m::Op(&x2)),
+                             m::Multiply(m::Op(&x), m::Op(&c)))) &&
+      x1 == x2 && x1 == x) {
+    // Create (A+B - C)
+    HloInstruction* sub_result = sub->AddInstruction(
+        HloInstruction::CreateBinary(sub->shape(), HloOpcode::kSubtract, x, c));
+    // Create (A+B) * (A+B - C)
+    return ReplaceWithNewInstruction(
+        sub, HloInstruction::CreateBinary(sub->shape(), HloOpcode::kMultiply, x,
+                                          sub_result));
+  }
+
   return absl::OkStatus();
 }
 namespace {
@@ -4103,6 +4120,10 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   if (moved_param_to_rhs) {
     return absl::OkStatus();
   }
+
+  // simplify dot(A, B), dot(A, C) -> Slice(dot_concat, start=0, limit=N1, axis=1), Slice(dot_concat, start=N1, limit=N1+N2, axis=1)
+  // Finish your code here
+
 
   return absl::OkStatus();
 }

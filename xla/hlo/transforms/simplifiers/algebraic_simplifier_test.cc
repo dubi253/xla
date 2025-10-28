@@ -1556,6 +1556,29 @@ TEST_F(AlgebraicSimplifierTest, SubAddReassociateMergeBroadcastedConstants) {
           m::Parameter(0))));
 }
 
+TEST_F(AlgebraicSimplifierTest, SquareMinusMultiply) {
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      p0 = f32[4] parameter(0)
+      p1 = f32[4] parameter(1)
+      add = f32[4] add(p0, p1)
+      square = f32[4] multiply(add, add)
+      multiply = f32[4] multiply(add, p1)
+      ROOT sub = f32[4] subtract(square, multiply)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  ASSERT_TRUE(AlgebraicSimplifier(default_options_).Run(m.get()).value());
+  // Should transform to: (A+B) * (A+B - C) where C is p1
+  EXPECT_THAT(
+      m->entry_computation()->root_instruction(),
+      GmockMatch(m::Multiply(
+          m::Add(m::Parameter(0), m::Parameter(1)),
+          m::Subtract(m::Add(m::Parameter(0), m::Parameter(1)),
+                      m::Parameter(1)))));
+}
+
 TEST_F(AlgebraicSimplifierTest, AddBroadcastZeroR0Operand) {
   auto m = CreateNewVerifiedModule();
   Shape r2f32 = ShapeUtil::MakeShape(F32, {3, 2});
