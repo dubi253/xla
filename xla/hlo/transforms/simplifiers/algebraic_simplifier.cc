@@ -6599,6 +6599,59 @@ absl::Status AlgebraicSimplifierVisitor::HandleReshape(
           BitcastingOperandOfReshapeOrCopyChain(reshape, options_)) {
     ReplaceWithBitcast(reshape, bitcast_operand);
   }
+
+  // Part 4
+  // Decompose a reshape that is not a bitcast into bitcast + copy
+  if (options_.is_layout_sensitive()) {
+    auto s = reshape->shape();
+    auto s0 = operand->shape();
+    
+    // Only decompose if this is not already a bitcast
+    if (!ShapeUtil::ReshapeIsBitcast(s, s0)) {
+      // Try to align the output layout with the input
+      if (auto output_aligned_input_shape = ShapeUtil::AlignLayouts(s, s0)) {
+        Shape new_input_shape = *output_aligned_input_shape;
+        HloInstruction* copied_operand = 
+            reshape->AddInstruction(HloInstruction::CreateUnary(
+                new_input_shape, HloOpcode::kCopy, operand));
+        VLOG(3) << "Decomposing reshape into bitcast and a physical "
+                   "transpose on the operand: "
+                << copied_operand->ToString();
+
+        auto bitcast_result = reshape->AddInstruction(
+            HloInstruction::CreateBitcast(s, copied_operand));
+        return ReplaceInstruction(reshape, bitcast_result);
+      } else if (auto input_aligned_output_shape = 
+                     ShapeUtil::AlignLayouts(s0, s)) {
+        // Try to align the input layout with the output
+        Shape new_output_shape = *input_aligned_output_shape;
+        auto bitcast_result = reshape->AddInstruction(
+            HloInstruction::CreateBitcast(new_output_shape, operand));
+        HloInstruction* copied_result = 
+            reshape->AddInstruction(HloInstruction::CreateUnary(
+                s, HloOpcode::kCopy, bitcast_result));
+        VLOG(3) << "Decomposing reshape into bitcast and a physical "
+                   "transposition on the result: "
+                << copied_result->ToString();
+        return ReplaceInstruction(reshape, copied_result);
+      } else {
+        VLOG(3) << "Both input and output of reshape are not alignable, create "
+                   "two physical transposes";
+        auto s0_normalized = ShapeUtil::MakeShapeWithDescendingLayout(
+            s0.element_type(), s0.dimensions());
+        auto c1 = reshape->AddInstruction(HloInstruction::CreateUnary(
+            s0_normalized, HloOpcode::kCopy, operand));
+        auto s_normalized = ShapeUtil::MakeShapeWithDescendingLayout(
+            s.element_type(), s.dimensions());
+        auto bitcast_result = reshape->AddInstruction(
+            HloInstruction::CreateBitcast(s_normalized, c1));
+        auto c2 = reshape->AddInstruction(HloInstruction::CreateUnary(
+            s, HloOpcode::kCopy, bitcast_result));
+        return ReplaceInstruction(reshape, c2);
+      }
+    }
+  }
+
   return absl::OkStatus();
 }
 

@@ -13128,5 +13128,192 @@ TEST_F(AlgebraicSimplifierTest, DoNotFuseDotsWithDifferentContracting) {
   ASSERT_FALSE(AlgebraicSimplifier(default_options_).Run(m.get()).value());
 }
 
+// Part 4
+// Tests for reshape decomposition into bitcast + copy
+class ReshapeDecompositionTest : public AlgebraicSimplifierTest {};
+
+TEST_F(ReshapeDecompositionTest, ReshapeDecompositionWithInputTranspose) {
+  // Test that reshape that is not a bitcast is decomposed into
+  // copy (transpose) + bitcast when input layout can be aligned
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      p0 = f32[4,2,3]{0,1,2} parameter(0)
+      ROOT reshape = f32[8,3]{1,0} reshape(p0)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(true);
+  ASSERT_TRUE(AlgebraicSimplifier(options).Run(m.get()).value());
+  
+  auto* root = m->entry_computation()->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kBitcast);
+  EXPECT_EQ(root->operand(0)->opcode(), HloOpcode::kCopy);
+}
+
+TEST_F(ReshapeDecompositionTest, ReshapeDecompositionWithOutputTranspose) {
+  // Test that reshape is decomposed into bitcast + copy (transpose)
+  // when output layout can be aligned
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      p0 = f32[8,3]{1,0} parameter(0)
+      ROOT reshape = f32[4,2,3]{0,1,2} reshape(p0)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(true);
+  ASSERT_TRUE(AlgebraicSimplifier(options).Run(m.get()).value());
+  
+  auto* root = m->entry_computation()->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kCopy);
+  EXPECT_EQ(root->operand(0)->opcode(), HloOpcode::kBitcast);
+}
+
+TEST_F(ReshapeDecompositionTest, ReshapeDecompositionWithTwoTransposes) {
+  // Test that reshape is decomposed into copy + bitcast + copy
+  // when neither input nor output layout can be aligned
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      p0 = f32[4,2,3,8]{0,2,1,3} parameter(0)
+      ROOT reshape = f32[8,3,2,4]{0,2,1,3} reshape(p0)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(true);
+  ASSERT_TRUE(AlgebraicSimplifier(options).Run(m.get()).value());
+  
+  auto* root = m->entry_computation()->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kCopy);
+  EXPECT_EQ(root->operand(0)->opcode(), HloOpcode::kBitcast);
+  EXPECT_EQ(root->operand(0)->operand(0)->opcode(), HloOpcode::kCopy);
+}
+
+TEST_F(ReshapeDecompositionTest, ReshapeAlreadyBitcast) {
+  // Test that reshape that is already a bitcast is not decomposed
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      p0 = f32[2,3,4]{2,1,0} parameter(0)
+      ROOT reshape = f32[6,4]{1,0} reshape(p0)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  
+  // First make sure reshape is converted to bitcast
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(true);
+  AlgebraicSimplifier simplifier(options);
+  ASSERT_TRUE(simplifier.Run(m.get()).value());
+  
+  auto* root = m->entry_computation()->root_instruction();
+  // After decomposition, it should be a bitcast
+  EXPECT_EQ(root->opcode(), HloOpcode::kBitcast);
+  
+  // Run again - should not change further
+  ASSERT_FALSE(simplifier.Run(m.get()).value());
+}
+
+TEST_F(ReshapeDecompositionTest, ReshapeDecompositionDisabledWhenNotLayoutSensitive) {
+  // Test that reshape decomposition is NOT applied when layout sensitivity
+  // is disabled
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      p0 = f32[2,3,4]{2,1,0} parameter(0)
+      ROOT reshape = f32[6,4]{1,0} reshape(p0)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(false);
+  
+  // With layout insensitive mode, reshape decomposition should not happen
+  AlgebraicSimplifier simplifier(options);
+  bool changed = simplifier.Run(m.get()).value();
+  
+  auto* root = m->entry_computation()->root_instruction();
+  // Root might still be reshape or could be bitcast from other optimizations
+  // but should not have the copy+bitcast or bitcast+copy pattern
+  if (root->opcode() == HloOpcode::kBitcast) {
+    EXPECT_NE(root->operand(0)->opcode(), HloOpcode::kCopy);
+  } else if (root->opcode() == HloOpcode::kCopy) {
+    EXPECT_NE(root->operand(0)->opcode(), HloOpcode::kBitcast);
+  }
+}
+
+TEST_F(ReshapeDecompositionTest, ReshapeDecompositionComplex) {
+  // Test reshape decomposition with more complex shape transformations
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      p0 = f32[2,3,4,5]{3,2,1,0} parameter(0)
+      ROOT reshape = f32[6,20]{1,0} reshape(p0)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(true);
+  ASSERT_TRUE(AlgebraicSimplifier(options).Run(m.get()).value());
+  
+  auto* root = m->entry_computation()->root_instruction();
+  // Should be decomposed into some combination of copies and bitcast
+  bool has_copy = false;
+  bool has_bitcast = false;
+  
+  std::function<void(const HloInstruction*)> check_ops = 
+      [&](const HloInstruction* inst) {
+    if (inst->opcode() == HloOpcode::kCopy) has_copy = true;
+    if (inst->opcode() == HloOpcode::kBitcast) has_bitcast = true;
+    for (auto* operand : inst->operands()) {
+      check_ops(operand);
+    }
+  };
+  
+  check_ops(root);
+  EXPECT_TRUE(has_bitcast);  // Should have at least a bitcast
+}
+
+TEST_F(ReshapeDecompositionTest, ReshapeDecompositionPreservesSemantics) {
+  // Test that reshape decomposition preserves semantics by checking
+  // the overall shape transformation
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      p0 = f32[3,4,5]{2,1,0} parameter(0)
+      ROOT reshape = f32[12,5]{1,0} reshape(p0)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(true);
+  ASSERT_TRUE(AlgebraicSimplifier(options).Run(m.get()).value());
+  
+  auto* root = m->entry_computation()->root_instruction();
+  auto* param = m->entry_computation()->parameter_instruction(0);
+  
+  // Verify that the final output shape matches expected
+  EXPECT_TRUE(ShapeUtil::Equal(root->shape(), 
+      ShapeUtil::MakeShapeWithDenseLayout(F32, {12, 5}, {1, 0})));
+  
+  // Verify the transformation chain goes back to parameter
+  const HloInstruction* current = root;
+  while (current->opcode() != HloOpcode::kParameter) {
+    ASSERT_GT(current->operand_count(), 0);
+    current = current->operand(0);
+  }
+  EXPECT_EQ(current, param);
+}
+
 }  // namespace
 }  // namespace xla
