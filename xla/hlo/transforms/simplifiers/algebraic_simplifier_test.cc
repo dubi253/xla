@@ -13036,5 +13036,97 @@ TEST_F(AlgebraicSimplifierTest, CopyReshapeToReshapeCopyWithHostCopies) {
   EXPECT_FALSE(simplifier.Run(m.get()).value());
 }
 
+TEST_F(AlgebraicSimplifierTest, FuseTwoDotsWithSharedLHS) {
+  // Test that two dots sharing the same LHS operand are fused into one
+  // dot(A, B) and dot(A, C) => split(dot(A, concat(B, C)))
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      lhs = f32[4,3] parameter(0)
+      rhs1 = f32[3,5] parameter(1)
+      rhs2 = f32[3,7] parameter(2)
+      dot1 = f32[4,5] dot(lhs, rhs1),
+        lhs_contracting_dims={1}, rhs_contracting_dims={0}
+      dot2 = f32[4,7] dot(lhs, rhs2),
+        lhs_contracting_dims={1}, rhs_contracting_dims={0}
+      ROOT tuple = (f32[4,5], f32[4,7]) tuple(dot1, dot2)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  ASSERT_TRUE(AlgebraicSimplifier(default_options_).Run(m.get()).value());
+
+  // After optimization, we should have:
+  // 1. A concatenate operation combining rhs1 and rhs2
+  // 2. A single dot operation
+  // 3. Two slice operations to extract results
+
+  HloInstruction* root = m->entry_computation()->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kTuple);
+
+  // Check that tuple operands are slices
+  EXPECT_EQ(root->operand(0)->opcode(), HloOpcode::kSlice);
+  EXPECT_EQ(root->operand(1)->opcode(), HloOpcode::kSlice);
+
+  // Both slices should come from the same dot
+  EXPECT_EQ(root->operand(0)->operand(0), root->operand(1)->operand(0));
+  EXPECT_EQ(root->operand(0)->operand(0)->opcode(), HloOpcode::kDot);
+
+  // The dot should have a concatenate as its RHS
+  const HloInstruction* fused_dot = root->operand(0)->operand(0);
+  EXPECT_EQ(fused_dot->operand(1)->opcode(), HloOpcode::kConcatenate);
+}
+
+TEST_F(AlgebraicSimplifierTest, FuseTwoDotsWithSharedLHS_BatchDims) {
+  // Test fusion with batch dimensions
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      lhs = f32[2,4,3] parameter(0)
+      rhs1 = f32[2,3,5] parameter(1)
+      rhs2 = f32[2,3,7] parameter(2)
+      dot1 = f32[2,4,5] dot(lhs, rhs1),
+        lhs_batch_dims={0}, rhs_batch_dims={0},
+        lhs_contracting_dims={2}, rhs_contracting_dims={1}
+      dot2 = f32[2,4,7] dot(lhs, rhs2),
+        lhs_batch_dims={0}, rhs_batch_dims={0},
+        lhs_contracting_dims={2}, rhs_contracting_dims={1}
+      ROOT tuple = (f32[2,4,5], f32[2,4,7]) tuple(dot1, dot2)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  ASSERT_TRUE(AlgebraicSimplifier(default_options_).Run(m.get()).value());
+
+  HloInstruction* root = m->entry_computation()->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kTuple);
+
+  // Check that tuple operands are slices
+  EXPECT_EQ(root->operand(0)->opcode(), HloOpcode::kSlice);
+  EXPECT_EQ(root->operand(1)->opcode(), HloOpcode::kSlice);
+
+  // Both slices should come from the same dot
+  EXPECT_EQ(root->operand(0)->operand(0), root->operand(1)->operand(0));
+  EXPECT_EQ(root->operand(0)->operand(0)->opcode(), HloOpcode::kDot);
+}
+
+TEST_F(AlgebraicSimplifierTest, DoNotFuseDotsWithDifferentContracting) {
+  // Test that dots with different contracting dimensions are not fused
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      lhs = f32[4,3,5] parameter(0)
+      rhs1 = f32[3,6] parameter(1)
+      rhs2 = f32[5,7] parameter(2)
+      dot1 = f32[4,5,6] dot(lhs, rhs1),
+        lhs_contracting_dims={1}, rhs_contracting_dims={0}
+      dot2 = f32[4,3,7] dot(lhs, rhs2),
+        lhs_contracting_dims={2}, rhs_contracting_dims={0}
+      ROOT tuple = (f32[4,5,6], f32[4,3,7]) tuple(dot1, dot2)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  // Should not optimize since contracting dimensions are different
+  ASSERT_FALSE(AlgebraicSimplifier(default_options_).Run(m.get()).value());
+}
+
 }  // namespace
 }  // namespace xla

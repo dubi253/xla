@@ -4121,9 +4121,130 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     return absl::OkStatus();
   }
 
-  // simplify dot(A, B), dot(A, C) -> Slice(dot_concat, start=0, limit=N1, axis=1), Slice(dot_concat, start=N1, limit=N1+N2, axis=1)
-  // Finish your code here
+  // tuple(dot(A, B), dot(A, C)) -> tuple(slice(dot(A, concat(B, C)), 0, n1),
+  // slice(dot(A, concat(B, C)), n1, n1+n2))
+  VLOG(10) << "trying transform [tuple(dot(A,B), dot(A,C)) => "
+              "tuple(slice(dot(A,concat(B,C)))...]: "
+           << dot->ToString();
 
+  HloInstruction *a, *b, *c, *a1;
+  HloInstruction *dot0, *dot1, *tuple;
+
+  // Check if this dot is the SECOND operand of a 2-element tuple
+  if (dot->user_count() == 1 &&
+      Match(dot->users()[0],
+            m::Tuple(&tuple, m::Dot(&dot0, m::Op(&a), m::Op(&b)).WithOneUser(),
+                     m::Dot(&dot1, m::Op(&a1), m::Op(&c)).WithOneUser())) &&
+      a == a1 && dot == dot1) {
+    HloDotInstruction* dot_inst0 = Cast<HloDotInstruction>(dot0);
+    HloDotInstruction* dot_inst1 = Cast<HloDotInstruction>(dot1);
+
+    // Check if dimension numbers are compatible
+    const DotDimensionNumbers& dnums0 = dot_inst0->dot_dimension_numbers();
+    const DotDimensionNumbers& dnums1 = dot_inst1->dot_dimension_numbers();
+
+    if (absl::c_equal(dnums0.lhs_contracting_dimensions(),
+                      dnums1.lhs_contracting_dimensions()) &&
+        absl::c_equal(dnums0.rhs_contracting_dimensions(),
+                      dnums1.rhs_contracting_dimensions()) &&
+        absl::c_equal(dnums0.lhs_batch_dimensions(),
+                      dnums1.lhs_batch_dimensions()) &&
+        absl::c_equal(dnums0.rhs_batch_dimensions(),
+                      dnums1.rhs_batch_dimensions()) &&
+        dot_inst0->shape().element_type() ==
+            dot_inst1->shape().element_type() &&
+        dot_inst0->shape().layout() == dot_inst1->shape().layout() &&
+        !dot_inst0->sparse_operands() && !dot_inst1->sparse_operands()) {
+      int64_t rhs_rank = b->shape().rank();
+      int64_t concat_dim = -1;
+
+      // Find the non-contracting, non-batch dimension on RHS
+      absl::flat_hash_set<int64_t> used_dims;
+      for (int64_t dim : dnums0.rhs_contracting_dimensions()) {
+        used_dims.insert(dim);
+      }
+      for (int64_t dim : dnums0.rhs_batch_dimensions()) {
+        used_dims.insert(dim);
+      }
+
+      for (int64_t i = 0; i < rhs_rank; ++i) {
+        if (!used_dims.contains(i)) {
+          if (concat_dim == -1) {
+            concat_dim = i;
+          } else {
+            concat_dim = -1;
+            break;
+          }
+        }
+      }
+
+      if (concat_dim != -1) {
+        VLOG(2) << "Merging tuple of dots sharing LHS operand:\n"
+                << "\t" << dot0->ToString() << "\n"
+                << "\t" << dot1->ToString();
+
+        // concat(B, C)
+        TF_ASSIGN_OR_RETURN(HloInstruction * concat_rhs,
+                            MakeConcatHlo({b, c}, concat_dim));
+
+        // dot(A, concat(B, C))
+        TF_ASSIGN_OR_RETURN(Shape merged_dot_shape,
+                            ShapeInference::InferDotOpShape(
+                                a->shape(), concat_rhs->shape(), dnums0,
+                                dot_inst0->shape().element_type()));
+        *merged_dot_shape.mutable_layout() = dot_inst0->shape().layout();
+
+        HloInstruction* merged_dot = computation_->AddInstruction(
+            HloInstruction::CreateDot(merged_dot_shape, a, concat_rhs, dnums0,
+                                      dot_inst0->precision_config()));
+
+        // Determine the slice dimension
+        int64_t slice_dim = dnums0.lhs_batch_dimensions_size();
+        for (int64_t i = 0; i < a->shape().rank(); ++i) {
+          if (!absl::c_linear_search(dnums0.lhs_contracting_dimensions(), i) &&
+              !absl::c_linear_search(dnums0.lhs_batch_dimensions(), i)) {
+            slice_dim++;
+          }
+        }
+        // concat_dim
+        for (int64_t i = 0; i < c->shape().rank(); ++i) {
+          if (!absl::c_linear_search(dnums0.rhs_contracting_dimensions(), i) &&
+              !absl::c_linear_search(dnums0.rhs_batch_dimensions(), i)) {
+            if (i == concat_dim) {
+              break;
+            }
+            slice_dim++;
+          }
+        }
+
+        // Create slices for each original dot result
+        std::vector<int64_t> start_indices0(merged_dot_shape.rank(), 0);
+        std::vector<int64_t> limit_indices0 =
+            SpanToVector(merged_dot_shape.dimensions());
+
+        limit_indices0[slice_dim] = b->shape().dimensions(concat_dim);
+        std::vector<int64_t> strides(merged_dot_shape.rank(), 1);
+
+        TF_ASSIGN_OR_RETURN(
+            HloInstruction * slice0,
+            MakeSliceHlo(merged_dot, start_indices0, limit_indices0, strides));
+
+        std::vector<int64_t> start_indices1(merged_dot_shape.rank(), 0);
+
+        start_indices1[slice_dim] = b->shape().dimensions(concat_dim);
+        std::vector<int64_t> limit_indices1 =
+            SpanToVector(merged_dot_shape.dimensions());
+
+        TF_ASSIGN_OR_RETURN(
+            HloInstruction * slice1,
+            MakeSliceHlo(merged_dot, start_indices1, limit_indices1, strides));
+
+        HloInstruction* new_tuple = computation_->AddInstruction(
+            HloInstruction::CreateTuple({slice0, slice1}));
+        return ReplaceInstruction(tuple, new_tuple);
+      }
+    }
+  }
 
   return absl::OkStatus();
 }
